@@ -1,0 +1,471 @@
+#!/usr/bin/env bash
+# Observium agent script for Proxmox Backup Server.
+#
+# Drop into /usr/lib/observium_agent/local/pbs (chmod 755) on a PBS host that
+# already runs the Observium Unix agent.
+#
+# Without configuration this script uses proxmox-backup-manager and df, which
+# is enough for capacity, task counts, scheduled jobs, and service state. For
+# per-datastore dedup factor and on-disk usage as PBS sees it, drop an API
+# token into /etc/observium/pbs.conf:
+#
+#   PBS_API_HOST=localhost
+#   PBS_API_PORT=8007
+#   PBS_API_TOKEN_ID='root@pam!observium'
+#   PBS_API_TOKEN_SECRET='xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+#   PBS_TASK_LIMIT=200      # how many recent tasks to fetch
+#   PBS_TASK_HOURS=24       # window for the tasks_summary counters
+#   PBS_RECENT_TASKS=15     # how many recent tasks to publish per run
+#
+# Output is a single Observium custom-app section, <<<app-pbs>>>, with
+# pipe-delimited records inside named subsections. The PHP poller side knows
+# this schema (schema_version=1).
+
+set -u
+export LC_ALL=C
+
+CONFIG_FILE=${PBS_CONFIG:-/etc/observium/pbs.conf}
+PBS_API_HOST=localhost
+PBS_API_PORT=8007
+PBS_API_TOKEN_ID=
+PBS_API_TOKEN_SECRET=
+PBS_TASK_LIMIT=200
+PBS_TASK_HOURS=24
+PBS_RECENT_TASKS=15
+
+if [ -r "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+fi
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+JQ_BIN=$(command -v jq 2>/dev/null || true)
+PBM_BIN=$(command -v proxmox-backup-manager 2>/dev/null || true)
+CURL_BIN=$(command -v curl 2>/dev/null || true)
+SYSTEMCTL_BIN=$(command -v systemctl 2>/dev/null || true)
+
+API_USED=0
+api_get() {
+    # api_get <path>  -- prints the .data payload of the API response
+    local path=$1
+    [ -z "$CURL_BIN" ] && return 1
+    [ -z "$PBS_API_TOKEN_ID" ] && return 1
+    [ -z "$PBS_API_TOKEN_SECRET" ] && return 1
+    local auth="PBSAPIToken=${PBS_API_TOKEN_ID}:${PBS_API_TOKEN_SECRET}"
+    local url="https://${PBS_API_HOST}:${PBS_API_PORT}/api2/json${path}"
+    "$CURL_BIN" -fsS -k --max-time 10 -H "Authorization: ${auth}" "$url" 2>/dev/null \
+        | { [ -n "$JQ_BIN" ] && "$JQ_BIN" -c '.data' || cat; }
+}
+
+# Escape pipe and newline so they don't break the wire format. Trim too —
+# proxmox-backup-manager occasionally returns trailing whitespace.
+sanitise() {
+    printf '%s' "$1" | tr -d '\r\n' | tr '|' '/'
+}
+
+emit() {
+    printf '%s\n' "$1"
+}
+
+# Translate a PBS namespace (slash-separated, e.g. "team-a/db") into its
+# on-disk path beneath the datastore root. The PBS layout interleaves an "ns"
+# directory between each level: "team-a/db" -> "ns/team-a/ns/db".
+ns_to_path() {
+    local store_path=$1 ns=$2
+    if [ -z "$ns" ]; then
+        printf '%s' "$store_path"
+        return
+    fi
+    local rel
+    rel=$(printf '%s' "$ns" | sed 's|/|/ns/|g')
+    printf '%s/ns/%s' "$store_path" "$rel"
+}
+
+# Count snapshots inside one namespace, exclusive of any nested namespaces.
+# PBS layout at the namespace root:   <ns_path>/<type>/<group>/<timestamp>/
+# Nested namespaces would be at:      <ns_path>/ns/<child>/...
+# We descend type dirs (skipping "ns") then count <group>/<timestamp> pairs.
+ns_snapshot_count() {
+    local nspath=$1
+    [ -d "$nspath" ] || { printf '0'; return; }
+    local n=0
+    while IFS= read -r typedir; do
+        local c
+        c=$(find "$typedir" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | wc -l)
+        n=$(( n + c ))
+    done < <(find "$nspath" -mindepth 1 -maxdepth 1 -type d ! -name ns 2>/dev/null)
+    printf '%s' "$n"
+}
+
+# Group count inside one namespace, exclusive of nested namespaces.
+# A group is one <type>/<group-name> pair (e.g. vm/100, ct/200).
+ns_group_count() {
+    local nspath=$1
+    [ -d "$nspath" ] || { printf '0'; return; }
+    local n=0
+    while IFS= read -r typedir; do
+        local c
+        c=$(find "$typedir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+        n=$(( n + c ))
+    done < <(find "$nspath" -mindepth 1 -maxdepth 1 -type d ! -name ns 2>/dev/null)
+    printf '%s' "$n"
+}
+
+# Filesystem-only fallback for enumerating namespaces under a store. PBS
+# always materialises ns/<seg>/[ns/<seg>/...] directories, so we discover them
+# by walking the tree for any "ns" directory and emitting the path that led
+# there. Returns one line per namespace, including the empty root namespace.
+fs_enumerate_namespaces() {
+    local store_path=$1
+    [ -d "$store_path" ] || return
+    printf '\n'  # root namespace
+    find "$store_path" -type d -name ns 2>/dev/null | while IFS= read -r ns_dir; do
+        # The path under "ns/" up to the next "ns" is one namespace segment.
+        # Listing children of ns_dir gives the segments at this level.
+        find "$ns_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | while IFS= read -r seg; do
+            # Build the namespace string by stripping store_path/ from seg and
+            # collapsing the alternating "ns/" separators.
+            local rel=${seg#"$store_path"/}
+            # rel is like "ns/team-a" or "ns/team-a/ns/db"
+            local ns=${rel#ns/}
+            ns=$(printf '%s' "$ns" | sed 's|/ns/|/|g')
+            printf '%s\n' "$ns"
+        done
+    done | sort -u
+}
+
+# Parse a namespace out of a task worker_id. PBS embeds it as either
+#   <store>:ns/<ns_path>:<rest>     (per-group/per-snapshot tasks)
+#   <store>:ns/<ns_path>            (whole-namespace tasks)
+# and the absence of "ns/" means the root namespace.
+parse_ns_from_worker_id() {
+    local wid=$1
+    case $wid in
+        *:ns/*)
+            local rest=${wid#*:ns/}
+            printf '%s' "${rest%%:*}"
+            ;;
+        *)
+            ;;
+    esac
+}
+
+now=$(date +%s)
+hostname=$(hostname -f 2>/dev/null || hostname)
+
+# ----------------------------------------------------------------------------
+# Header
+# ----------------------------------------------------------------------------
+emit '<<<app-pbs>>>'
+emit 'schema_version=2'
+emit "collected_at=${now}"
+
+# ----------------------------------------------------------------------------
+# info
+# ----------------------------------------------------------------------------
+emit 'section=info'
+emit "hostname=$(sanitise "$hostname")"
+
+pbs_version='unknown'
+pbs_release='unknown'
+if [ -n "$PBM_BIN" ]; then
+    if [ -n "$JQ_BIN" ]; then
+        ver_json=$("$PBM_BIN" versions --output-format=json 2>/dev/null || true)
+        if [ -n "$ver_json" ]; then
+            pbs_version=$(printf '%s' "$ver_json" | "$JQ_BIN" -r '.[]? | select(.Package=="proxmox-backup-server" or .Package=="proxmox-backup") | .Version' 2>/dev/null | head -n1)
+            [ -z "$pbs_version" ] && pbs_version='unknown'
+        fi
+    else
+        pbs_version=$("$PBM_BIN" versions 2>/dev/null | awk '/proxmox-backup(-server)?[[:space:]]/ {print $2; exit}')
+        [ -z "$pbs_version" ] && pbs_version='unknown'
+    fi
+fi
+emit "version=$(sanitise "$pbs_version")"
+emit "release=$(sanitise "$pbs_release")"
+
+# Probe the API early so we can use it later if available.
+if api_test=$(api_get /version 2>/dev/null) && [ -n "$api_test" ]; then
+    API_USED=1
+fi
+emit "api_used=${API_USED}"
+
+# ----------------------------------------------------------------------------
+# services
+# ----------------------------------------------------------------------------
+emit 'section=services'
+if [ -n "$SYSTEMCTL_BIN" ]; then
+    for unit in proxmox-backup proxmox-backup-proxy; do
+        state=$("$SYSTEMCTL_BIN" is-active "$unit" 2>/dev/null || true)
+        [ -z "$state" ] && state='unknown'
+        emit "${unit}=$(sanitise "$state")"
+    done
+else
+    emit 'proxmox-backup=unknown'
+    emit 'proxmox-backup-proxy=unknown'
+fi
+
+# ----------------------------------------------------------------------------
+# datastores
+# ----------------------------------------------------------------------------
+emit 'section=datastores'
+
+declare -a DS_NAMES=()
+declare -A DS_PATHS=()
+
+if [ -n "$PBM_BIN" ] && [ -n "$JQ_BIN" ]; then
+    ds_list=$("$PBM_BIN" datastore list --output-format=json 2>/dev/null || true)
+    if [ -n "$ds_list" ]; then
+        while IFS=$'\t' read -r name path; do
+            [ -z "$name" ] && continue
+            DS_NAMES+=("$name")
+            DS_PATHS[$name]=$path
+        done < <(printf '%s' "$ds_list" | "$JQ_BIN" -r '.[]? | [.name, .path] | @tsv' 2>/dev/null)
+    fi
+fi
+
+# Fallback: parse /etc/proxmox-backup/datastore.cfg directly.
+if [ ${#DS_NAMES[@]} -eq 0 ] && [ -r /etc/proxmox-backup/datastore.cfg ]; then
+    cur_name=''
+    while IFS= read -r line; do
+        case $line in
+            'datastore: '*)
+                cur_name=${line#datastore: }
+                cur_name=${cur_name%% *}
+                DS_NAMES+=("$cur_name")
+                DS_PATHS[$cur_name]=''
+                ;;
+            *path*)
+                if [ -n "$cur_name" ]; then
+                    p=$(printf '%s' "$line" | awk '{print $2}')
+                    DS_PATHS[$cur_name]=$p
+                fi
+                ;;
+        esac
+    done < /etc/proxmox-backup/datastore.cfg
+fi
+
+# Most-recent garbage-collection per datastore from the task list. We'll fill
+# these maps lazily once we have the task list.
+declare -A GC_LAST_RUN=()
+declare -A GC_STATUS=()
+declare -A GC_DURATION=()
+
+task_json=''
+if [ -n "$PBM_BIN" ] && [ -n "$JQ_BIN" ]; then
+    task_json=$("$PBM_BIN" task list --all --limit "${PBS_TASK_LIMIT}" --output-format=json 2>/dev/null || true)
+    if [ -n "$task_json" ]; then
+        # Use a non-whitespace separator (ASCII Unit Separator) between
+        # fields. With whitespace IFS, bash's read collapses runs of separator
+        # characters and silently eats empty fields — wrong for jq output
+        # where columns may legitimately be empty (e.g. no worker_id).
+        while IFS=$'\x1f' read -r ds endtime status duration; do
+            [ -z "$ds" ] && continue
+            # Keep the first hit per store — list is newest-first.
+            if [ -z "${GC_LAST_RUN[$ds]+x}" ]; then
+                GC_LAST_RUN[$ds]=$endtime
+                GC_STATUS[$ds]=$status
+                GC_DURATION[$ds]=$duration
+            fi
+        done < <(printf '%s' "$task_json" | "$JQ_BIN" -r '
+            [.[]? | select(.worker_type=="garbage_collection") |
+                {ds: .worker_id, endtime: (.endtime // 0),
+                 status: (.status // "running"),
+                 duration: ((.endtime // 0) - (.starttime // 0))}]
+            | .[] |
+                "\(.ds // "")\(.endtime)\(.status)\(.duration)"' 2>/dev/null)
+    fi
+fi
+
+# NS_RECORDS accumulates one line per (store, namespace) for the namespaces
+# section, captured here while we already have store paths in hand.
+declare -a NS_RECORDS=()
+
+for name in "${DS_NAMES[@]}"; do
+    path=${DS_PATHS[$name]:-}
+    total=0; used=0; avail=0; fs_total=0; fs_used=0
+    snapshots=0
+    namespace_count=0
+    gc_status=${GC_STATUS[$name]:-unknown}
+    gc_last_run=${GC_LAST_RUN[$name]:-0}
+    gc_duration=${GC_DURATION[$name]:-0}
+    dedup_factor=0
+
+    if [ -n "$path" ] && [ -d "$path" ]; then
+        # 1K blocks → bytes. POSIX-ish df works everywhere.
+        if read -r _ blocks used_kb avail_kb _ _ < <(df -kP "$path" 2>/dev/null | awk 'NR==2'); then
+            fs_total=$(( blocks * 1024 ))
+            fs_used=$(( used_kb * 1024 ))
+            total=$fs_total
+            used=$fs_used
+            avail=$(( avail_kb * 1024 ))
+        fi
+    fi
+
+    # Enumerate namespaces — CLI / API preferred, filesystem walk as fallback.
+    declare -a ns_list=()
+    if [ -n "$PBM_BIN" ] && [ -n "$JQ_BIN" ]; then
+        ns_json=$("$PBM_BIN" namespace list "$name" --max-depth 7 --output-format=json 2>/dev/null || true)
+        if [ -n "$ns_json" ] && [ "$ns_json" != 'null' ]; then
+            while IFS= read -r ns_entry; do
+                ns_list+=("$ns_entry")
+            done < <(printf '%s' "$ns_json" | "$JQ_BIN" -r '.[]? | .ns // ""' 2>/dev/null)
+        fi
+    fi
+    if [ "$API_USED" = 1 ] && [ ${#ns_list[@]} -eq 0 ]; then
+        ns_json=$(api_get "/admin/datastore/${name}/namespace?max-depth=7" 2>/dev/null || true)
+        if [ -n "$ns_json" ] && [ "$ns_json" != 'null' ] && [ -n "$JQ_BIN" ]; then
+            while IFS= read -r ns_entry; do
+                ns_list+=("$ns_entry")
+            done < <(printf '%s' "$ns_json" | "$JQ_BIN" -r '.[]? | .ns // ""' 2>/dev/null)
+        fi
+    fi
+    if [ ${#ns_list[@]} -eq 0 ] && [ -n "$path" ] && [ -d "$path" ]; then
+        while IFS= read -r ns_entry; do
+            ns_list+=("$ns_entry")
+        done < <(fs_enumerate_namespaces "$path")
+    fi
+    if [ ${#ns_list[@]} -eq 0 ]; then
+        ns_list=("")  # ensure root namespace is always represented
+    fi
+
+    # Walk namespaces: get groups + snapshot counts. Prefer the API when
+    # available because it sees real metadata (and respects pruning state).
+    store_snapshots=0
+    for ns_entry in "${ns_list[@]}"; do
+        ns_snap=0
+        ns_grp=0
+        if [ "$API_USED" = 1 ] && [ -n "$JQ_BIN" ]; then
+            ns_q=${ns_entry//\//%2F}
+            grp_json=$(api_get "/admin/datastore/${name}/groups?ns=${ns_q}" 2>/dev/null || true)
+            if [ -n "$grp_json" ] && [ "$grp_json" != 'null' ]; then
+                read -r ns_grp ns_snap < <(printf '%s' "$grp_json" \
+                    | "$JQ_BIN" -r '[length, ([.[]?."backup-count" // 0] | add // 0)] | @tsv' 2>/dev/null)
+                ns_grp=${ns_grp:-0}; ns_snap=${ns_snap:-0}
+            fi
+        fi
+        if [ "$ns_snap" = 0 ] && [ -n "$path" ]; then
+            ns_path=$(ns_to_path "$path" "$ns_entry")
+            ns_snap=$(ns_snapshot_count "$ns_path")
+            ns_grp=$(ns_group_count "$ns_path")
+        fi
+        store_snapshots=$(( store_snapshots + ns_snap ))
+
+        # Stash for the namespaces section; depth = number of '/' in ns.
+        if [ -z "$ns_entry" ]; then
+            depth=0
+        else
+            depth=$(printf '%s' "$ns_entry" | awk -F/ '{print NF}')
+        fi
+        NS_RECORDS+=("store=$(sanitise "$name")|ns=$(sanitise "$ns_entry")|depth=${depth}|snapshots=${ns_snap}|groups=${ns_grp}")
+    done
+    snapshots=$store_snapshots
+    namespace_count=${#ns_list[@]}
+
+    # Richer datastore-level numbers via the API when we have a token.
+    if [ "$API_USED" = 1 ]; then
+        status_json=$(api_get "/admin/datastore/${name}/status" 2>/dev/null || true)
+        if [ -n "$status_json" ] && [ "$status_json" != 'null' ] && [ -n "$JQ_BIN" ]; then
+            api_total=$(printf '%s' "$status_json" | "$JQ_BIN" -r '.total // 0')
+            api_used=$(printf '%s' "$status_json"  | "$JQ_BIN" -r '.used  // 0')
+            api_avail=$(printf '%s' "$status_json" | "$JQ_BIN" -r '.avail // 0')
+            api_dedup=$(printf '%s' "$status_json" | "$JQ_BIN" -r '."deduplication-factor" // ."dedup-factor" // 0' 2>/dev/null || true)
+            [ -n "$api_total" ] && [ "$api_total" != 'null' ] && total=$api_total
+            [ -n "$api_used"  ] && [ "$api_used"  != 'null' ] && used=$api_used
+            [ -n "$api_avail" ] && [ "$api_avail" != 'null' ] && avail=$api_avail
+            [ -n "$api_dedup" ] && [ "$api_dedup" != 'null' ] && [ "$api_dedup" != '' ] && dedup_factor=$api_dedup
+        fi
+    fi
+
+    emit "name=$(sanitise "$name")|path=$(sanitise "$path")|total=${total}|used=${used}|avail=${avail}|fs_total=${fs_total}|fs_used=${fs_used}|snapshots=${snapshots}|namespace_count=${namespace_count}|gc_status=$(sanitise "$gc_status")|gc_last_run=${gc_last_run}|gc_duration=${gc_duration}|dedup_factor=${dedup_factor}"
+
+    unset ns_list
+done
+
+# Emit the namespaces section now that all stores have been walked.
+emit 'section=namespaces'
+for rec in "${NS_RECORDS[@]}"; do
+    emit "$rec"
+done
+
+# ----------------------------------------------------------------------------
+# tasks_summary
+# ----------------------------------------------------------------------------
+emit 'section=tasks_summary'
+emit "window_hours=${PBS_TASK_HOURS}"
+since=$(( now - PBS_TASK_HOURS * 3600 ))
+total_count=0; ok_count=0; warn_count=0; err_count=0; run_count=0
+if [ -n "$task_json" ] && [ -n "$JQ_BIN" ]; then
+    counts=$(printf '%s' "$task_json" | "$JQ_BIN" -r --argjson since "$since" '
+        [ .[]? | select(((.starttime // 0) >= $since) or ((.endtime // 0) >= $since)) ] as $w
+        | {
+            total:   ($w | length),
+            ok:      ([$w[]  | select((.status // "running") == "OK")] | length),
+            warning: ([$w[]  | select((.status // "")        | startswith("WARNINGS"))] | length),
+            error:   ([$w[]  | select(((.status // "") | startswith("ERROR")) or ((.status // "") == "ERROR"))] | length),
+            running: ([$w[]  | select((.endtime // 0) == 0)] | length)
+          }
+        | "\(.total)\t\(.ok)\t\(.warning)\t\(.error)\t\(.running)"' 2>/dev/null)
+    if [ -n "$counts" ]; then
+        IFS=$'\t' read -r total_count ok_count warn_count err_count run_count <<<"$counts"
+    fi
+fi
+emit "total=${total_count:-0}"
+emit "ok=${ok_count:-0}"
+emit "warning=${warn_count:-0}"
+emit "error=${err_count:-0}"
+emit "running=${run_count:-0}"
+
+# ----------------------------------------------------------------------------
+# recent_tasks
+# ----------------------------------------------------------------------------
+emit 'section=recent_tasks'
+if [ -n "$task_json" ] && [ -n "$JQ_BIN" ]; then
+    printf '%s' "$task_json" | "$JQ_BIN" -r --argjson n "$PBS_RECENT_TASKS" '
+        [ .[]? ] | sort_by(-(.starttime // 0)) | .[:$n] | .[] |
+        [
+            (.upid // ""),
+            (.worker_type // ""),
+            (.user // .worker // ""),
+            (.worker_id // ""),
+            (.status // "running"),
+            ((.starttime // 0)|tostring),
+            ((.endtime // 0)|tostring),
+            (((.endtime // 0) - (.starttime // 0))|tostring)
+        ] | join("")' 2>/dev/null | \
+    while IFS=$'\x1f' read -r upid wtype user wid status starttime endtime duration; do
+        ns=$(parse_ns_from_worker_id "$wid")
+        emit "upid=$(sanitise "$upid")|type=$(sanitise "$wtype")|worker=$(sanitise "$user")|target=$(sanitise "$wid")|ns=$(sanitise "$ns")|status=$(sanitise "$status")|starttime=${starttime}|endtime=${endtime}|duration=${duration}"
+    done
+fi
+
+# ----------------------------------------------------------------------------
+# jobs (sync, verify, prune)
+# ----------------------------------------------------------------------------
+emit 'section=jobs'
+if [ -n "$PBM_BIN" ] && [ -n "$JQ_BIN" ]; then
+    for kind in sync verify prune; do
+        out=$("$PBM_BIN" "${kind}-job" list --output-format=json 2>/dev/null || true)
+        [ -z "$out" ] && continue
+        printf '%s' "$out" | "$JQ_BIN" -r --arg kind "$kind" '
+            .[]? | [
+                $kind,
+                (.id // ""),
+                (.store // .source // ""),
+                (.ns // ""),
+                (."remote-ns" // ""),
+                ((."max-depth" // 0)|tostring),
+                (.schedule // ""),
+                ((."last-run-endtime" // 0)|tostring),
+                ((."next-run" // 0)|tostring),
+                (."last-run-state" // ""),
+                (."last-run-upid" // ""),
+                (.disable // false | tostring)
+            ] | join("")' 2>/dev/null | \
+        while IFS=$'\x1f' read -r jk jid jstore jns jrns jmd jsched jlast jnext jstate jupid jdis; do
+            emit "kind=$(sanitise "$jk")|id=$(sanitise "$jid")|store=$(sanitise "$jstore")|ns=$(sanitise "$jns")|remote_ns=$(sanitise "$jrns")|max_depth=$(sanitise "$jmd")|schedule=$(sanitise "$jsched")|last_run=${jlast}|next_run=${jnext}|state=$(sanitise "$jstate")|upid=$(sanitise "$jupid")|disabled=$(sanitise "$jdis")"
+        done
+    done
+fi
+
+emit 'section=end'
