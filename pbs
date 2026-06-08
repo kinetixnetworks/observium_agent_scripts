@@ -273,7 +273,7 @@ if [ -n "$PBM_BIN" ] && [ -n "$JQ_BIN" ]; then
                  status: (.status // "running"),
                  duration: ((.endtime // 0) - (.starttime // 0))}]
             | .[] |
-                "\(.ds // "")\(.endtime)\(.status)\(.duration)"' 2>/dev/null)
+                "\(.ds // "")\u001f\(.endtime)\u001f\(.status)\u001f\(.duration)"' 2>/dev/null)
     fi
 fi
 
@@ -432,7 +432,7 @@ if [ -n "$task_json" ] && [ -n "$JQ_BIN" ]; then
             ((.starttime // 0)|tostring),
             ((.endtime // 0)|tostring),
             (((.endtime // 0) - (.starttime // 0))|tostring)
-        ] | join("")' 2>/dev/null | \
+        ] | join("\u001f")' 2>/dev/null | \
     while IFS=$'\x1f' read -r upid wtype user wid status starttime endtime duration; do
         ns=$(parse_ns_from_worker_id "$wid")
         emit "upid=$(sanitise "$upid")|type=$(sanitise "$wtype")|worker=$(sanitise "$user")|target=$(sanitise "$wid")|ns=$(sanitise "$ns")|status=$(sanitise "$status")|starttime=${starttime}|endtime=${endtime}|duration=${duration}"
@@ -461,7 +461,7 @@ if [ -n "$PBM_BIN" ] && [ -n "$JQ_BIN" ]; then
                 (."last-run-state" // ""),
                 (."last-run-upid" // ""),
                 (.disable // false | tostring)
-            ] | join("")' 2>/dev/null | \
+            ] | join("\u001f")' 2>/dev/null | \
         while IFS=$'\x1f' read -r jk jid jstore jns jrns jmd jsched jlast jnext jstate jupid jdis; do
             emit "kind=$(sanitise "$jk")|id=$(sanitise "$jid")|store=$(sanitise "$jstore")|ns=$(sanitise "$jns")|remote_ns=$(sanitise "$jrns")|max_depth=$(sanitise "$jmd")|schedule=$(sanitise "$jsched")|last_run=${jlast}|next_run=${jnext}|state=$(sanitise "$jstate")|upid=$(sanitise "$jupid")|disabled=$(sanitise "$jdis")"
         done
