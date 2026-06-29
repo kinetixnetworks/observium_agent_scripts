@@ -1,58 +1,50 @@
 <?php
 /**
- * Observium application POLLER module — FreeSWITCH.
+ * Observium FreeSWITCH application poller
  *
- * Deploy to:  includes/polling/applications/freeswitch.inc.php
+ * Install path:
+ *   <observium_root>/includes/polling/applications/freeswitch.inc.php
  *
- * Consumes the `<<<app-freeswitch>>>` UNIX-agent block (one `key:value` line
- * per metric) emitted by the kinetix observium_agent_scripts/freeswitch script
- * and stores it into RRD + application_metrics.
+ * Reads the <<<app-freeswitch>>> section emitted by the agent script (one
+ * `key:value` line per metric) and writes it to RRD. Mirrors the galera module:
+ * discover_app() creates/returns the app row (this is what makes Observium
+ * discover the app), update_application() stores the metric set, and
+ * rrdtool_update_ng() updates the RRD by app name.
  *
  * RRD DS names are capped at 19 chars by rrdtool, so the longer agent keys are
- * mapped to short DS names below; application_metrics keep the full key.
+ * mapped to short DS names below.
  */
 
-// Raw agent payload Observium collected for this app on this device.
-$freeswitch = $agent_data['app']['freeswitch'];
+if (!empty($agent_data['app']['freeswitch'])) {
 
-// Parse "key:value" lines into an associative array.
-$fs = [];
-foreach (explode("\n", $freeswitch) as $line) {
-    if (strpos($line, ':') === false) {
-        continue;
+    $app_id = discover_app($device, 'freeswitch');
+
+    // Parse "key:value" lines from the agent into an assoc array.
+    $raw = array();
+    foreach (explode("\n", $agent_data['app']['freeswitch']) as $line) {
+        if (strpos($line, ':') === false) { continue; }
+        list($k, $v) = explode(':', $line, 2);
+        $raw[trim($k)] = trim($v);
     }
-    [$key, $value] = explode(':', $line, 2);
-    $fs[trim($key)] = trim($value);
+
+    // agent key => RRD DS name (<=19 chars)
+    $map = array(
+        'calls'                  => 'calls',
+        'channels'               => 'channels',
+        'sessions'               => 'sessions',
+        'sessions_peak'          => 'sess_peak',
+        'sessions_persec'        => 'sess_persec',
+        'sessions_persec_peak'   => 'sess_persec_pk',
+        'sessions_max'           => 'sess_max',
+        'sessions_since_startup' => 'sess_total',
+    );
+
+    $fields = array();
+    foreach ($map as $agent_key => $ds) {
+        $fields[$ds] = (isset($raw[$agent_key]) && is_numeric($raw[$agent_key])) ? $raw[$agent_key] : 0;
+    }
+
+    update_application($app_id, $fields);
+
+    rrdtool_update_ng($device, 'freeswitch', $fields, $app_id);
 }
-
-// agent key => [ rrd DS name (<=19 chars), DS type ]
-// Instantaneous values are GAUGE; the cumulative "since startup" total is
-// DERIVE so a FreeSWITCH restart (counter reset) doesn't spike the graph.
-$map = [
-    'calls'                  => ['calls',          'GAUGE'],
-    'channels'               => ['channels',       'GAUGE'],
-    'sessions'               => ['sessions',       'GAUGE'],
-    'sessions_peak'          => ['sess_peak',      'GAUGE'],
-    'sessions_persec'        => ['sess_persec',    'GAUGE'],
-    'sessions_persec_peak'   => ['sess_persec_pk', 'GAUGE'],
-    'sessions_max'           => ['sess_max',       'GAUGE'],
-    'sessions_since_startup' => ['sess_total',     'DERIVE'],
-];
-
-$rrd_def = [];
-$fields  = [];
-$metrics = [];
-foreach ($map as $key => [$ds, $type]) {
-    $value = isset($fs[$key]) && is_numeric($fs[$key]) ? $fs[$key] : 'U';
-    $min   = $type === 'DERIVE' ? '0' : 'U';
-    $rrd_def[]      = "DS:$ds:$type:600:$min:U";
-    $fields[$ds]    = $value;
-    $metrics[$key]  = $value;   // alerting / auto-discovery use the full name
-}
-
-$rrd_filename = 'app-freeswitch-' . $app['app_id'] . '.rrd';
-rrdtool_update($device, $rrd_filename, $fields, $rrd_def);
-
-update_application($app, $freeswitch, $metrics);
-
-unset($freeswitch, $fs, $map, $rrd_def, $fields, $metrics, $rrd_filename);

@@ -1,0 +1,86 @@
+#!/bin/bash
+#
+# Observium UNIX-agent script: keepalived VRRP state + statistics.
+#
+# Mirrors the sibling scripts: probe for the binary, emit a single
+# `<<<app-keepalived>>>` header, then one `key:value` line per metric.
+# Installed to /usr/lib/check_mk_agent/plugins/keepalived by the SNMP/Observium
+# onboarding playbook and run by observium_agent (as root).
+#
+# keepalived has no live query interface; the documented way to read its state
+# is to signal it to dump to /tmp — SIGUSR1 -> /tmp/keepalived.data (per-instance
+# state), SIGUSR2 -> /tmp/keepalived.stats (counters). This needs no special
+# build flags (unlike --enable-json) so it works on a stock keepalived. Signals
+# go to every keepalived pid; the VRRP child writes the files a moment later.
+
+PATH_KEEPALIVED="/usr/sbin/keepalived"
+
+if [[ -x "$PATH_KEEPALIVED" ]]; then
+    KABIN="$PATH_KEEPALIVED"
+else
+    KABIN=$(command -v keepalived)
+fi
+
+[ -z "$KABIN" ] && exit 0   # not installed — emit nothing
+
+echo '<<<app-keepalived>>>'
+
+PIDS=$(pidof keepalived 2>/dev/null)
+if [ -z "$PIDS" ]; then
+    # Installed but not running: report cleanly so the graph shows "down"
+    # rather than a gap.
+    echo "running:0"
+    echo "instances:0"
+    echo "master:0"
+    echo "backup:0"
+    echo "fault:0"
+    echo "became_master:0"
+    echo "adv_sent:0"
+    echo "adv_received:0"
+    exit 0
+fi
+echo "running:1"
+
+DATA=/tmp/keepalived.data
+STATS=/tmp/keepalived.stats
+
+# Ask keepalived to refresh both dumps, then give the VRRP child a moment to
+# write them.
+kill -USR1 $PIDS 2>/dev/null
+kill -USR2 $PIDS 2>/dev/null
+sleep 1
+
+# ── Per-instance VRRP state, from the data dump ────────────────────────────
+# Lines look like "   State = MASTER" (BACKUP / FAULT / INIT / STOP).
+MASTER=0; BACKUP=0; FAULT=0; INSTANCES=0
+if [ -r "$DATA" ]; then
+    while read -r state; do
+        INSTANCES=$((INSTANCES + 1))
+        case "$state" in
+            MASTER) MASTER=$((MASTER + 1)) ;;
+            BACKUP) BACKUP=$((BACKUP + 1)) ;;
+            FAULT)  FAULT=$((FAULT + 1)) ;;
+        esac
+    done < <(grep -E '^[[:space:]]*State[[:space:]]*=' "$DATA" | awk '{print $NF}')
+fi
+echo "instances:$INSTANCES"
+echo "master:$MASTER"
+echo "backup:$BACKUP"
+echo "fault:$FAULT"
+
+# ── Aggregate counters, from the stats dump ────────────────────────────────
+# Sum "Became master" and the Advertisements Received/Sent across instances.
+# Advertisements is a sub-block; only the Received/Sent lines IMMEDIATELY under
+# it count (Priority Zero etc. also have Received/Sent lines).
+if [ -r "$STATS" ]; then
+    eval "$(awk '
+        /Advertisements:/        { adv = 1; next }
+        adv && /Received:/       { r += $NF; next }
+        adv && /Sent:/           { s += $NF; adv = 0; next }
+        /Became master:/         { bm += $NF }
+        END { printf "BM=%d; ADVR=%d; ADVS=%d", bm+0, r+0, s+0 }
+    ' "$STATS")"
+fi
+echo "became_master:${BM:-0}"
+echo "adv_sent:${ADVS:-0}"
+echo "adv_received:${ADVR:-0}"

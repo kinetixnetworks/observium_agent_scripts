@@ -1,19 +1,30 @@
 <?php
 /**
- * Observium application GRAPH — keepalived VRRP advertisement rate.
- * Deploy to:  html/includes/graphs/application/keepalived_adverts.inc.php
+ * html/includes/graphs/application/keepalived_adverts.inc.php
  *
- * adv_sent / adv_received are DERIVE DS, so the graph shows adverts per second.
+ * VRRP advertisement rate. adv_sent / adv_received are cumulative keepalived
+ * counters stored as DERIVE, so this reads as adverts per second.
  */
 
-$rrd_filename = rrd_name($device['hostname'], ['app', 'keepalived', $app['app_id']]);
+include($config['html_dir']."/includes/graphs/common.inc.php");
 
-$rrd_list = [
-    ['filename' => $rrd_filename, 'descr' => 'Sent',     'ds' => 'adv_sent',     'colour' => '4f9fdf'],
-    ['filename' => $rrd_filename, 'descr' => 'Received', 'ds' => 'adv_received', 'colour' => '4fbf4f'],
-];
+$rrd_filename = get_rrd_path($device, "app-keepalived-".$app['app_id'].".rrd");
 
-$unit_text = 'Adverts/sec';
-$nototal   = TRUE;
+if (is_file($rrd_filename)) {
 
-include $config['html_dir'] . '/includes/graphs/generic_multi_line.inc.php';
+    $rrd_options .= " --vertical-label='Adverts/sec'";
+    $rrd_options .= " --lower-limit=0";
+
+    $rrd_options .= " DEF:sent=$rrd_filename:adv_sent:AVERAGE";
+    $rrd_options .= " DEF:recv=$rrd_filename:adv_received:AVERAGE";
+
+    $rrd_options .= " LINE1.5:sent#1E5A8C:'Sent     '";
+    $rrd_options .= " GPRINT:sent:LAST:%7.2lf";
+    $rrd_options .= " GPRINT:sent:AVERAGE:%7.2lf";
+    $rrd_options .= " GPRINT:sent:MAX:%7.2lf\\l";
+
+    $rrd_options .= " LINE1.5:recv#006600:'Received '";
+    $rrd_options .= " GPRINT:recv:LAST:%7.2lf";
+    $rrd_options .= " GPRINT:recv:AVERAGE:%7.2lf";
+    $rrd_options .= " GPRINT:recv:MAX:%7.2lf\\l";
+}
