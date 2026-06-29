@@ -19,6 +19,39 @@
  * "unknown" instead of a negative spike).
  */
 
+// >>> ktx-cfg:rtpengine >>>
+$config['rrd_types']['rtpengine'] = array(
+    'file' => 'app-rtpengine-%index%.rrd',
+    'ds'   => array(
+        'sessions'         => array('type' => 'GAUGE',  'min' => 0, 'max' => 'U'),
+        'sessions_own'     => array('type' => 'GAUGE',  'min' => 0, 'max' => 'U'),
+        'sessions_foreign' => array('type' => 'GAUGE',  'min' => 0, 'max' => 'U'),
+        'transcoded'       => array('type' => 'GAUGE',  'min' => 0, 'max' => 'U'),
+        'relayed_packets'  => array('type' => 'DERIVE', 'min' => 0, 'max' => 'U'),
+        'relayed_bytes'    => array('type' => 'DERIVE', 'min' => 0, 'max' => 'U'),
+        'relayed_errors'   => array('type' => 'DERIVE', 'min' => 0, 'max' => 'U'),
+    ),
+);
+$config['app']['rtpengine']['top'] = array('sessions', 'traffic');
+// <<< ktx-cfg:rtpengine <<<
+
+// >>> ktx-cfg:kamailio >>>
+$config['rrd_types']['kamailio'] = array(
+    'file' => 'app-kamailio-%index%.rrd',
+    'ds'   => array(
+        'registered'     => array('type' => 'GAUGE',  'min' => 0, 'max' => 'U'),
+        'active_dialogs' => array('type' => 'GAUGE',  'min' => 0, 'max' => 'U'),
+        'tx_active'      => array('type' => 'GAUGE',  'min' => 0, 'max' => 'U'),
+        'rcv_requests'   => array('type' => 'DERIVE', 'min' => 0, 'max' => 'U'),
+        'rcv_replies'    => array('type' => 'DERIVE', 'min' => 0, 'max' => 'U'),
+        'fwd_requests'   => array('type' => 'DERIVE', 'min' => 0, 'max' => 'U'),
+        'shmem_used'     => array('type' => 'GAUGE',  'min' => 0, 'max' => 'U'),
+        'shmem_max'      => array('type' => 'GAUGE',  'min' => 0, 'max' => 'U'),
+    ),
+);
+$config['app']['kamailio']['top'] = array('sessions', 'messages');
+// <<< ktx-cfg:kamailio <<<
+
 // >>> ktx-cfg:freeswitch >>>
 $config['rrd_types']['freeswitch'] = array(
     'file' => 'app-freeswitch-%index%.rrd',

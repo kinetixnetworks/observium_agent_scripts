@@ -1,0 +1,47 @@
+#!/bin/bash
+#
+# Observium UNIX-agent script: kamailio (SIP proxy) stats.
+#
+# Emits a single <<<app-kamailio>>> header then key:value metrics. Installed to
+# /usr/lib/check_mk_agent/plugins/kamailio by the SNMP onboarding playbook and
+# run by observium_agent (as root).
+#
+# Reads stats via kamcmd (binrpc to the ctl socket; needs the `ctl` module
+# loaded, which Kamailio loads by default). Some stats only exist when their
+# module is loaded (dialog/usrloc/tm) — those default to 0. If kamcmd needs a
+# non-default socket, set it in /etc/observium/kamailio.conf, e.g.:
+#     KAMCMD_OPTS="-s /var/run/kamailio/kamailio_ctl"
+
+PATH_KAMCMD="/usr/sbin/kamcmd"
+
+if [[ -x "$PATH_KAMCMD" ]]; then
+    KAMCMD="$PATH_KAMCMD"
+else
+    KAMCMD=$(command -v kamcmd)
+fi
+
+[ -z "$KAMCMD" ] && ! command -v kamailio >/dev/null 2>&1 && exit 0
+
+KAMCMD_OPTS=""
+[ -r /etc/observium/kamailio.conf ] && . /etc/observium/kamailio.conf
+
+echo '<<<app-kamailio>>>'
+
+[ -z "$KAMCMD" ] && { echo "registered:0"; exit 0; }
+
+# Fetch one statistic by "group:name"; output is "group:name = <value>".
+# Returns 0 for an unknown stat (module not loaded) or any error.
+kstat() {
+    local v
+    v=$($KAMCMD $KAMCMD_OPTS stats.get_statistics "$1" 2>/dev/null | sed -n 's/.*= *//p' | head -1)
+    if [[ "$v" =~ ^[0-9]+$ ]]; then echo "$v"; else echo 0; fi
+}
+
+echo "registered:$(kstat usrloc:registered_users)"
+echo "active_dialogs:$(kstat dialog:active_dialogs)"
+echo "tx_active:$(kstat tm:inuse_transactions)"
+echo "rcv_requests:$(kstat core:rcv_requests)"
+echo "rcv_replies:$(kstat core:rcv_replies)"
+echo "fwd_requests:$(kstat core:fwd_requests)"
+echo "shmem_used:$(kstat shmem:used_size)"
+echo "shmem_max:$(kstat shmem:real_used_size)"

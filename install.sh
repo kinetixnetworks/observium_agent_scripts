@@ -26,7 +26,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SUPPORTED=(freeswitch keepalived galera)
+SUPPORTED=(freeswitch keepalived rtpengine kamailio galera)
 
 ROOT="${OBSERVIUM_ROOT:-/opt/observium}"
 CONFIG_PHP=""

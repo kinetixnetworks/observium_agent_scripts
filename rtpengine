@@ -1,0 +1,56 @@
+#!/bin/bash
+#
+# Observium UNIX-agent script: rtpengine (media proxy) sessions + relayed traffic.
+#
+# Emits a single <<<app-rtpengine>>> header then key:value metrics. Installed to
+# /usr/lib/check_mk_agent/plugins/rtpengine by the SNMP onboarding playbook and
+# run by observium_agent (as root).
+#
+# Talks to rtpengine via rtpengine-ctl (the control CLI). It connects to the
+# configured listen-cli (default 127.0.0.1:9900). If yours differs, set the
+# options in /etc/observium/rtpengine.conf, e.g.:
+#     RTPENGINE_CTL_OPTS="--ip 127.0.0.1 --port 9900"
+# which is sourced below — keeps host/port out of git.
+
+PATH_RTPCTL="/usr/bin/rtpengine-ctl"
+
+if [[ -x "$PATH_RTPCTL" ]]; then
+    CTL="$PATH_RTPCTL"
+else
+    CTL=$(command -v rtpengine-ctl)
+fi
+
+# Nothing to talk to if neither the control tool nor the daemon is present.
+[ -z "$CTL" ] && ! command -v rtpengine >/dev/null 2>&1 && exit 0
+
+RTPENGINE_CTL_OPTS=""
+[ -r /etc/observium/rtpengine.conf ] && . /etc/observium/rtpengine.conf
+
+echo '<<<app-rtpengine>>>'
+
+[ -z "$CTL" ] && { echo "sessions:0"; exit 0; }   # daemon present but no ctl tool
+
+NUM=$($CTL $RTPENGINE_CTL_OPTS list numsessions 2>/dev/null)
+TOT=$($CTL $RTPENGINE_CTL_OPTS list totals 2>/dev/null)
+
+# Pull "<int>" from the end of the first line matching a label.
+field() { echo "$1" | grep -i -m1 "$2" | grep -oE '[0-9]+' | tail -1; }
+
+SESSIONS=$(field "$NUM" 'sessions total')
+SESS_OWN=$(field "$NUM" 'sessions own')
+SESS_FOREIGN=$(field "$NUM" 'sessions foreign')
+TRANSCODED=$(field "$NUM" 'transcoded media')
+
+# Cumulative relayed counters (best-effort label match — verify against your
+# rtpengine version's `list totals` output; default 0 when not present).
+REL_PACKETS=$(field "$TOT" 'relayed packets')
+REL_BYTES=$(field "$TOT" 'relayed bytes')
+REL_ERRORS=$(field "$TOT" 'relayed errors')
+
+echo "sessions:${SESSIONS:-0}"
+echo "sessions_own:${SESS_OWN:-0}"
+echo "sessions_foreign:${SESS_FOREIGN:-0}"
+echo "transcoded:${TRANSCODED:-0}"
+echo "relayed_packets:${REL_PACKETS:-0}"
+echo "relayed_bytes:${REL_BYTES:-0}"
+echo "relayed_errors:${REL_ERRORS:-0}"
