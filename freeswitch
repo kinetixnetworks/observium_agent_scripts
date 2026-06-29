@@ -1,0 +1,68 @@
+#!/bin/bash
+#
+# Observium UNIX-agent script: FreeSWITCH call/channel stats.
+#
+# Mirrors the conventions of the sibling `asterisk` script: probe for the
+# binary, emit a single `<<<app-freeswitch>>>` header, then one `key:value`
+# line per metric. Installed to /usr/lib/check_mk_agent/plugins/freeswitch by
+# the SNMP/Observium onboarding playbook and run by observium_agent.
+#
+# Talks to FreeSWITCH over the event socket via fs_cli. The default ESL target
+# is 127.0.0.1:8021 / ClueCon. If you've changed the mod_event_socket password,
+# DO NOT hardcode it here — drop it into /etc/observium/freeswitch.conf, e.g.:
+#
+#     FS_CLI_OPTS="-H 127.0.0.1 -P 8021 -p YOUR_ESL_PASSWORD"
+#
+# which is sourced below. That keeps the secret out of git, consistent with the
+# onboarding rule that agent scripts never carry credentials.
+
+PATH_FS_CLI="/usr/bin/fs_cli"
+
+if [[ -x "$PATH_FS_CLI" ]]; then
+    FSCLI="$PATH_FS_CLI"
+else
+    FSCLI=$(command -v fs_cli)
+fi
+
+[ -z "$FSCLI" ] && exit 0   # FreeSWITCH not installed — emit nothing
+
+FS_CLI_OPTS=""
+[ -r /etc/observium/freeswitch.conf ] && . /etc/observium/freeswitch.conf
+
+fscmd () {
+    # -x runs one command and exits; strip ANSI colour codes fs_cli emits.
+    $FSCLI $FS_CLI_OPTS -x "$1" 2>/dev/null | sed -r 's/\x1B\[[0-9;]*[mK]//g'
+}
+
+# Bail quietly if the event socket isn't reachable (FS down / wrong password),
+# so we never emit half a block of garbage.
+STATUS=$(fscmd 'status')
+[ -z "$STATUS" ] && exit 0
+
+# Active calls / channels — "<n> total."
+CALLS=$(fscmd 'show calls count'    | grep -o '[0-9]\+ total' | head -1 | cut -d' ' -f1)
+CHANNELS=$(fscmd 'show channels count' | grep -o '[0-9]\+ total' | head -1 | cut -d' ' -f1)
+
+# From `status`:
+#   "<n> session(s) since startup"
+#   "<cur> session(s) - peak <peak>, last 5min <l5>"
+#   "<ps> session(s) per Sec out of max <max>, peak <pspeak>, last 5min <l5>"
+SINCE_STARTUP=$(echo "$STATUS"   | grep 'session(s) since startup' | grep -o '[0-9]\+' | head -1)
+SESSION_LINE=$(echo "$STATUS"    | grep 'session(s) - peak')
+PERSEC_LINE=$(echo "$STATUS"     | grep 'session(s) per Sec')
+MAXSESS=$(echo "$STATUS"         | grep 'session(s) max' | grep -o '[0-9]\+' | head -1)
+
+SESSIONS=$(echo "$SESSION_LINE"      | grep -o '^[0-9]\+')
+SESSIONS_PEAK=$(echo "$SESSION_LINE" | grep -o 'peak [0-9]\+' | grep -o '[0-9]\+')
+SESSIONS_PER_SEC=$(echo "$PERSEC_LINE"      | grep -o '^[0-9]\+')
+SESSIONS_PER_SEC_PEAK=$(echo "$PERSEC_LINE" | grep -o 'peak [0-9]\+' | grep -o '[0-9]\+')
+
+echo '<<<app-freeswitch>>>'
+echo "calls:${CALLS:-0}"
+echo "channels:${CHANNELS:-0}"
+echo "sessions:${SESSIONS:-0}"
+echo "sessions_peak:${SESSIONS_PEAK:-0}"
+echo "sessions_persec:${SESSIONS_PER_SEC:-0}"
+echo "sessions_persec_peak:${SESSIONS_PER_SEC_PEAK:-0}"
+echo "sessions_since_startup:${SINCE_STARTUP:-0}"
+echo "sessions_max:${MAXSESS:-0}"
